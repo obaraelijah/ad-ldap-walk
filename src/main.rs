@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
     
     let password: &str = todo!();
 
+    // LDAP connection
     let (conn, mut ldap) = LdapConnAsync::new(format!("ldap://{}", cmdline.server).as_ref())
         .await
         .map_err(|e| anyhow!("Unable to connect to {}: {}", cmdline.server, e))?;
@@ -68,5 +69,37 @@ async fn main() -> Result<()> {
     // Do this in a separate operation just to make for a better error message
     std::fs::create_dir_all(&people_dir)
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", people_dir, e))?;
+
+    for root_user in &cmdline.root_users {
+        build_trees(
+            &state_dir, 
+            &root_user, 
+            &mut ldap, 
+            &cmdline.search_base, 
+            &people_dir
+        )
+        .await
+        .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
+    }
+
+    Ok(())
+}
+
+async fn build_trees(
+    state_dir: &PathBuf,
+    root_user: &str,
+    ldap: &mut Ldap,
+    search_base: &str,
+    people_dir: &PathBuf,
+) -> Result<()> {
+    let mut state_filepath = state_dir.clone();
+    state_filepath.push(format!("{}.json", root_user));
+    let mut dump_filepath = state_dir.clone();
+    dump_filepath.push(format!("{}-hier.txt", root_user));
+    let mut dump_filepath_tmp = state_dir.clone();
+    dump_filepath_tmp.push(format!(".{}-hier.txt.tmp", root_user));
+    let mut hier_fh = tokio::fs::File::create(&dump_filepath_tmp)
+        .await
+        .map_err(|e| anyhow!("Unable to create {:?}: {}", &dump_filepath_tmp, e))?;
     Ok(())
 }
