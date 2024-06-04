@@ -12,6 +12,8 @@ use env_logger::Env;
 use log::*;
 use structopt::StructOpt;
 
+mod utils;
+
 const MAX_QUERY_USERS: usize = 128;
 
 #[derive(Debug, StructOpt)]
