@@ -9,6 +9,8 @@ env_logger = "0.11.3"
 log = "0.4.11"
 ldap3 = "0.11.4"
 rpassword = "7.3.1"
+serde = { version = "1.0.117", features = ["derive"] }
+serde_json = "1.0.59"
 structopt = { version = "0.3.20", default-features = false }
 tokio = { version = "1.38.0", features = ["full"] }
 
