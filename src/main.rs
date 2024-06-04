@@ -1,7 +1,8 @@
 use crate::utils::{cmp_attr, get_attr};
 use serde::{Deserialize, Serialize};
+
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
 };
@@ -137,6 +138,10 @@ async fn build_trees(
     let mut remaining = VecDeque::new();
     remaining.push_back(root_user.to_owned());
 
+    let mut n_queries: i32 = 0;
+    while !remaining.is_empty() {
+        
+    }
     Ok(())
 }
 
@@ -254,3 +259,36 @@ fn dn2user(dn: &str) -> Option<&str> {
         .find(|s| s.starts_with("CN="))
         .map(|s| &s[3..])
 }
+
+fn compare_managers(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
+    let mut changes = vec![];
+    let mut new_users: HashSet<&str> = HashSet::new();
+    cur_ss.emp_manager.keys().for_each(|u| {
+        new_users.insert(u);
+    });
+    for (userid, old_manager) in &old_ss.emp_manager {
+        new_users.remove(userid.as_str());
+        if let Some(cur_manager) = cur_ss.emp_manager.get(userid) {
+            if cur_manager != old_manager {
+                changes.push(format!(
+                    "  {} now reports to {} (was {})",
+                    userid, cur_manager, old_manager
+                ))
+            }
+        } else {
+            changes.push(format!("  {} no longer exists", userid));
+        }
+    }
+    new_users.into_iter().for_each(|userid| {
+        changes.push(format!(
+            "  {} is new, reports to {}",
+            userid,
+            cur_ss.emp_manager.get(userid).unwrap()
+        ))
+    });
+    if !changes.is_empty() {
+        changes.insert(0, "Employee manager changes\n".to_owned());
+    }
+    changes
+}
+
