@@ -1,9 +1,11 @@
+use crate::utils::{cmp_attr, get_attr};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     path::PathBuf,
 };
+use tokio::io::AsyncWriteExt;
 
 use anyhow::{anyhow, Result};
 use ldap3::{Ldap, LdapConnAsync, Scope, SearchEntry};
@@ -171,4 +173,84 @@ async fn query(ldap: &mut Ldap, search_base: &str, query: &str) -> Result<Vec<Se
         .into_iter()
         .map(SearchEntry::construct)
         .collect::<Vec<SearchEntry>>())
+}
+
+async fn handle_result(
+    current_user: &str,
+    result: &SearchEntry,
+    cur_state: &mut SavedState,
+    remaining: &mut VecDeque<String>,
+    root_user: &str,
+    heir_fh: &mut tokio::fs::File,
+) -> Result<()> {
+    if let Some(Some(manager_userid)) = result
+        .attrs
+        .get("manager")
+        .map(|m| m.get(0).unwrap())
+        .map(|m| dn2user(m))
+    {
+        cur_state
+            .emp_manager
+            .insert(current_user.to_owned(), manager_userid.to_owned());
+
+        if let Some(attr_reports) = result.attrs.get("directReports") {
+            if !attr_reports.is_empty() {
+                let mut these_reports = attr_reports
+                    .iter()
+                    .map(|dn| dn2user(dn).unwrap().to_owned())
+                    .collect::<Vec<String>>();
+                these_reports.sort();
+                cur_state
+                    .manager_reports
+                    .insert(current_user.to_owned(), these_reports.clone());
+                // remaining.append(&mut these_reports);
+                these_reports
+                    .into_iter()
+                    .for_each(|userid| remaining.push_back(userid));
+            }
+        }
+    }
+
+    heir_fh
+        .write_all(generate_oneliner(root_user, current_user, &cur_state.emp_manager).as_bytes())
+        .await?;
+    Ok(())
+}
+
+/**
+ * Print out a one-line record for this user's hierarchy
+ */
+fn generate_oneliner(
+    root_user: &str,
+    user: &str,
+    emp_manager: &BTreeMap<String, String>,
+) -> String {
+    let mut oneliner = String::new();
+    let mut current_user = user;
+
+    let mut hierarchy = vec![current_user];
+    while current_user != root_user {
+        match emp_manager.get(current_user) {
+            Some(manager_userid) => {
+                hierarchy.push(manager_userid);
+                current_user = manager_userid;
+            }
+            None => {
+                warn!("No manager for {}?", current_user);
+                break;
+            }
+        }
+    }
+
+    hierarchy.into_iter().rev().enumerate().for_each(|(i, u)| {
+        oneliner.push_str(format!("{}{}", if i > 0 { "," } else { "" }, u).as_str())
+    });
+    oneliner.push('\n');
+    oneliner
+}
+
+fn dn2user(dn: &str) -> Option<&str> {
+    dn.split(',')
+        .find(|s| s.starts_with("CN="))
+        .map(|s| &s[3..])
 }

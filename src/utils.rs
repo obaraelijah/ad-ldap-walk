@@ -19,3 +19,4 @@ pub fn cmp_attr(result_a: &SearchEntry, result_b: &SearchEntry, attr: &'static s
         (Some(_), None) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
+}
