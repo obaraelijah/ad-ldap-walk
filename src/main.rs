@@ -1,6 +1,6 @@
 use crate::utils::{cmp_attr, get_attr};
 use serde::{Deserialize, Serialize};
-
+use itertools::Itertools;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
@@ -139,9 +139,7 @@ async fn build_trees(
     remaining.push_back(root_user.to_owned());
 
     let mut n_queries: i32 = 0;
-    while !remaining.is_empty() {
-        
-    }
+    while !remaining.is_empty() {}
     Ok(())
 }
 
@@ -161,7 +159,6 @@ fn build_query(users: &mut VecDeque<String>) -> String {
             .join("")
     )
 }
-
 
 async fn query(ldap: &mut Ldap, search_base: &str, query: &str) -> Result<Vec<SearchEntry>> {
     let (rs, _res) = ldap
@@ -292,3 +289,70 @@ fn compare_managers(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
     changes
 }
 
+fn compare_reports(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
+    let mut changes = vec![];
+    let mut new_managers = HashSet::new();
+    // Assume everyone is new until we see they were already there
+    cur_ss.manager_reports.keys().for_each(|m| {
+        new_managers.insert(m);
+    });
+
+    for (manager, old_reports) in &old_ss.manager_reports {
+        let mut new_reports = vec![];
+
+        // Not new
+        new_managers.remove(manager);
+        if let Some(cur_reports) = cur_ss.manager_reports.get(manager) {
+            // Something changed?  Go find it
+            if old_reports != cur_reports {
+                let mut old_reports: HashSet<String> = old_reports.clone().into_iter().collect();
+                cur_reports.iter().for_each(|cur_report| {
+                    if !old_reports.contains(cur_report) {
+                        new_reports.push(cur_report);
+                    } else {
+                        old_reports.remove(cur_report);
+                    }
+                });
+                // Found some new employees
+                if !new_reports.is_empty() {
+                    changes.push(format!(
+                        "  {} now report(s) to {}",
+                        new_reports.iter().format(", "),
+                        manager
+                    ));
+                }
+                // Anyone we didn't see?
+                if !old_reports.is_empty() {
+                    let mut del_reports = old_reports.drain().collect::<Vec<String>>();
+                    del_reports.sort();
+                    changes.push(format!(
+                        "  {} no longer report(s) to {}",
+                        del_reports.iter().format(", "),
+                        manager
+                    ));
+                }
+            }
+        } else {
+            changes.push(format!("  {} no longer has any reports", manager))
+        }
+    }
+
+    // Anyone with reports that didn't exist before?
+    new_managers.into_iter().for_each(|manager| {
+        changes.push(format!(
+            "  {} now report to NEW manager {}",
+            cur_ss
+                .manager_reports
+                .get(manager)
+                .unwrap()
+                .iter()
+                .format(", "),
+            manager
+        ))
+    });
+
+    if !changes.is_empty() {
+        changes.insert(0, "Manager employee changes\n".to_owned());
+    }
+    changes
+}
