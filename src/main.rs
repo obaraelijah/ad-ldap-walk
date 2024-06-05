@@ -289,6 +289,17 @@ fn compare_managers(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
     changes
 }
 
+fn find_changes(old_state: &SavedState, cur_state: &SavedState) -> Vec<String> {
+    let mut changes = compare_managers(&old_state, &cur_state);
+    let mut direct_report_changes = compare_reports(&old_state, &cur_state);
+    if !direct_report_changes.is_empty() {
+        changes.push("".to_owned());
+        changes.append(&mut direct_report_changes);
+    }
+
+    changes
+}
+
 fn compare_reports(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
     let mut changes = vec![];
     let mut new_managers = HashSet::new();
