@@ -20,6 +20,17 @@ mod utils;
 const MAX_QUERY_USERS: usize = 128;
 
 #[derive(Debug, StructOpt)]
+/// Walk an LDAP server to discern reporting structure
+///
+/// Outputs a set of shell variable assignments depending on the extent of work
+/// performed.  Each is suffixed with the corresponding root user.
+///
+/// * If a new saved state is generated (either due to being the
+///   first run, or changes since the last): SAVESTATE_rootuser=PATH
+///
+/// * If a new reporting chain file is written: REPORTING_CHAIN_rootuser=PATH
+///
+/// * If changes are detected, the report: CHANGES_rootuser=PATH
 struct CmdlineOpts {
     /// ID to bind with.  This may take the form of an e-mail address
     #[structopt(short = "u", long, value_name = "USERID")]
