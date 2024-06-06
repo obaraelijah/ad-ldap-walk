@@ -71,7 +71,34 @@ async fn main() -> Result<()> {
 
     let cmdline = CmdlineOpts::from_args();
 
-    let password: &str = todo!();
+    #[cfg(target_os = "macos")]
+    let (password, set_new_password) = loop {
+        use security_framework::os::macos::keychain::SecKeychain;
+        let mut keychain = SecKeychain::default()?;
+        keychain.unlock(None)?;
+        info!(
+            "Querying macOS Keychain for {}/{}",
+            cmdline.server, &cmdline.bind_user
+        );
+        match keychain.find_generic_password(&cmdline.server, &cmdline.bind_user) {
+            Err(e) => match &e.code() {
+                -25300 => {
+                    info!("Password not found in macOS Keychain");
+                    break (
+                        rpassword::read_password_from_tty(Some(
+                            format!("Enter password for {}: ", cmdline.server).as_str(),
+                        ))
+                        .map_err(|e| anyhow!("Failed to read password from TTY: {}", e))?,
+                        true,
+                    );
+                }
+                code => {
+                    panic!("Error code={} message={:?}", code, e.message());
+                }
+            },
+            Ok((password, _)) => break (String::from_utf8(password.as_ref().to_vec())?, false),
+        }
+    };
 
     // LDAP connection
     let (conn, mut ldap) = LdapConnAsync::new(format!("ldap://{}", cmdline.server).as_ref())
