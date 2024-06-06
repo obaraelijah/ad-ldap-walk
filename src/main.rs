@@ -1,23 +1,17 @@
-use crate::utils::{cmp_attr, get_attr};
-use serde::{Deserialize, Serialize};
+use crate::utils::*;
+use anyhow::{anyhow, Result};
 use itertools::Itertools;
-use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
-    fs,
-    path::PathBuf,
-};
+use ldap3::{Ldap, LdapConnAsync, Scope, SearchEntry};
+use log::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
 
-use anyhow::{anyhow, Result};
-use ldap3::{Ldap, LdapConnAsync, Scope, SearchEntry};
-
-use env_logger::Env;
-use log::*;
-use structopt::StructOpt;
+const MAX_QUERY_USERS: usize = 128;
 
 mod utils;
-
-const MAX_QUERY_USERS: usize = 128;
 
 #[derive(Debug, StructOpt)]
 /// Walk an LDAP server to discern reporting structure
@@ -48,6 +42,10 @@ struct CmdlineOpts {
     #[structopt(short = "d", long, value_name = "PATH")]
     state_dir: Option<String>,
 
+    /// Save individual entries
+    #[structopt(short = "c", long)]
+    cache_people: bool,
+
     /// User(s) highest up the food chain
     #[structopt(value_name = "USERID")]
     root_users: Vec<String>,
@@ -67,7 +65,7 @@ struct SavedState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init_from_env(Env::default().default_filter_or("debug"));
+    env_logger::init();
 
     let cmdline = CmdlineOpts::from_args();
 
@@ -100,11 +98,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // LDAP connection
     let (conn, mut ldap) = LdapConnAsync::new(format!("ldap://{}", cmdline.server).as_ref())
         .await
         .map_err(|e| anyhow!("Unable to connect to {}: {}", cmdline.server, e))?;
 
+    // This thing just sits in the background
     let _cxnhandle = tokio::spawn(async move {
         if let Err(e) = conn.drive().await {
             warn!("LDAP connection error: {}", e);
@@ -114,7 +112,6 @@ async fn main() -> Result<()> {
     ldap.simple_bind(&cmdline.bind_user, &password)
         .await
         .map_err(|e| anyhow!("Unable to bind to {}: {}", cmdline.server, e))?;
-
     if cmdline.root_users.is_empty() {
         return Err(anyhow!("root user(s) not specified"));
     }
@@ -127,7 +124,6 @@ async fn main() -> Result<()> {
     people_dir.push("entries");
     std::fs::create_dir_all(&state_dir)
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", &state_dir, e))?;
-
     // Do this in a separate operation just to make for a better error message
     std::fs::create_dir_all(&people_dir)
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", people_dir, e))?;
@@ -139,6 +135,7 @@ async fn main() -> Result<()> {
             &mut ldap,
             &cmdline.search_base,
             &people_dir,
+            cmdline.cache_people,
         )
         .await
         .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
@@ -167,6 +164,7 @@ async fn build_trees(
     ldap: &mut Ldap,
     search_base: &str,
     people_dir: &PathBuf,
+    cache_people: bool,
 ) -> Result<()> {
     let mut state_filepath = state_dir.clone();
     state_filepath.push(format!("{}.json", root_user));
@@ -186,12 +184,137 @@ async fn build_trees(
         manager_reports,
     };
 
-    // seed the tree the root user
+    // Seed the tree the root user
     let mut remaining = VecDeque::new();
     remaining.push_back(root_user.to_owned());
 
     let mut n_queries: i32 = 0;
-    while !remaining.is_empty() {}
+    while !remaining.is_empty() {
+        let mut people_entries = vec![];
+        let query_str = build_query(&mut remaining);
+        debug!("querying {:?}", query_str);
+        n_queries += 1;
+        let mut results = query(ldap, &search_base, &query_str)
+            .await
+            .map_err(|e| anyhow!("Failed to query {}: {}", &query_str, e))?;
+        results.sort_by(|a, b| cmp_attr(a, b, "cn"));
+        for result in results {
+            let this_username = get_attr(&result, "cn")
+                .ok_or_else(|| anyhow!("Record for {} missing CN", result.dn))?;
+
+            if cache_people {
+                people_entries.push((this_username.to_owned(), format!("{:#?}", &result)));
+            }
+
+            handle_result(
+                this_username,
+                &result,
+                &mut cur_state,
+                &mut remaining,
+                &root_user,
+                &mut hier_fh,
+            )
+            .await?;
+        }
+
+        if !people_entries.is_empty() {
+            let people_dir = people_dir.clone();
+            tokio::spawn(async move {
+                for (username, entry) in people_entries {
+                    let mut path = people_dir.clone();
+                    path.push(format!("{}.txt", username));
+                    if let Err(e) = tokio::fs::write(&path, entry).await {
+                        warn!("Unable to write to {:?}: {}", path, e);
+                    }
+                }
+            });
+        }
+    }
+    info!("Completed with {} individual queries", n_queries);
+
+    let should_write_cur_state = if let Ok(old_ss_fh) = std::fs::File::open(&state_filepath) {
+        let old_ss: SavedState = serde_json::from_reader(old_ss_fh)
+            .map_err(|e| anyhow!("Failed to parse JSON from {:?}: {}", &state_filepath, e))?;
+        let changes = find_changes(&old_ss, &cur_state);
+        if changes.is_empty() {
+            false
+        } else {
+            // Write 'em out
+            let mut changes_path = state_dir.clone();
+            let now = chrono::Utc::now();
+            changes_path.push(format!(
+                "{}-diffs-{}.txt",
+                root_user,
+                now.format("%Y-%m-%d-%H-%M-%S")
+            ));
+            let mut changes_fh = tokio::fs::File::create(&changes_path)
+                .await
+                .map_err(|e| anyhow!("Failed to create {:?}: {}", &changes_path, e))?;
+            for mut change in changes {
+                change.push('\n');
+                changes_fh
+                    .write_all(change.as_bytes())
+                    .await
+                    .map_err(|e| anyhow!("Failed to write to {:?}: {}", &changes_path, e))?;
+            }
+            println!("CHANGES_{}={:?}", root_user, changes_path);
+            true
+        }
+    } else {
+        // Didn't have a saved state
+        true
+    };
+
+    if should_write_cur_state {
+        std::fs::write(&state_filepath, serde_json::to_string(&cur_state)?)?;
+        println!("SAVESTATE_{}={:?}", root_user, &state_filepath);
+        std::fs::rename(dump_filepath_tmp, &dump_filepath)?;
+        println!("REPORTING_CHAIN_{}={:?}", root_user, &dump_filepath);
+    } else {
+        std::fs::remove_file(dump_filepath_tmp)?;
+    }
+    Ok(())
+}
+
+async fn handle_result(
+    this_username: &str,
+    result: &SearchEntry,
+    cur_state: &mut SavedState,
+    remaining: &mut VecDeque<String>,
+    root_user: &str,
+    heir_fh: &mut tokio::fs::File,
+) -> Result<()> {
+    if let Some(Some(manager_userid)) = result
+        .attrs
+        .get("manager")
+        .map(|m| m.get(0).unwrap())
+        .map(|m| dn2user(m))
+    {
+        cur_state
+            .emp_manager
+            .insert(this_username.to_owned(), manager_userid.to_owned());
+
+        if let Some(attr_reports) = result.attrs.get("directReports") {
+            if !attr_reports.is_empty() {
+                let mut these_reports = attr_reports
+                    .iter()
+                    .map(|dn| dn2user(dn).unwrap().to_owned())
+                    .collect::<Vec<String>>();
+                these_reports.sort();
+                cur_state
+                    .manager_reports
+                    .insert(this_username.to_owned(), these_reports.clone());
+                // remaining.append(&mut these_reports);
+                these_reports
+                    .into_iter()
+                    .for_each(|userid| remaining.push_back(userid));
+            }
+        }
+    }
+
+    heir_fh
+        .write_all(generate_oneliner(root_user, this_username, &cur_state.emp_manager).as_bytes())
+        .await?;
     Ok(())
 }
 
@@ -229,46 +352,10 @@ async fn query(ldap: &mut Ldap, search_base: &str, query: &str) -> Result<Vec<Se
         .collect::<Vec<SearchEntry>>())
 }
 
-async fn handle_result(
-    current_user: &str,
-    result: &SearchEntry,
-    cur_state: &mut SavedState,
-    remaining: &mut VecDeque<String>,
-    root_user: &str,
-    heir_fh: &mut tokio::fs::File,
-) -> Result<()> {
-    if let Some(Some(manager_userid)) = result
-        .attrs
-        .get("manager")
-        .map(|m| m.get(0).unwrap())
-        .map(|m| dn2user(m))
-    {
-        cur_state
-            .emp_manager
-            .insert(current_user.to_owned(), manager_userid.to_owned());
-
-        if let Some(attr_reports) = result.attrs.get("directReports") {
-            if !attr_reports.is_empty() {
-                let mut these_reports = attr_reports
-                    .iter()
-                    .map(|dn| dn2user(dn).unwrap().to_owned())
-                    .collect::<Vec<String>>();
-                these_reports.sort();
-                cur_state
-                    .manager_reports
-                    .insert(current_user.to_owned(), these_reports.clone());
-                // remaining.append(&mut these_reports);
-                these_reports
-                    .into_iter()
-                    .for_each(|userid| remaining.push_back(userid));
-            }
-        }
-    }
-
-    heir_fh
-        .write_all(generate_oneliner(root_user, current_user, &cur_state.emp_manager).as_bytes())
-        .await?;
-    Ok(())
+fn dn2user(dn: &str) -> Option<&str> {
+    dn.split(',')
+        .find(|s| s.starts_with("CN="))
+        .map(|s| &s[3..])
 }
 
 /**
@@ -280,33 +367,37 @@ fn generate_oneliner(
     emp_manager: &BTreeMap<String, String>,
 ) -> String {
     let mut oneliner = String::new();
-    let mut current_user = user;
-
-    let mut hierarchy = vec![current_user];
-    while current_user != root_user {
-        match emp_manager.get(current_user) {
+    let mut this_username = user;
+    let mut hier = vec![this_username];
+    while this_username != root_user {
+        match emp_manager.get(this_username) {
             Some(manager_userid) => {
-                hierarchy.push(manager_userid);
-                current_user = manager_userid;
+                hier.push(manager_userid);
+                this_username = manager_userid;
             }
             None => {
-                warn!("No manager for {}?", current_user);
+                warn!("No manager for {}?", this_username);
                 break;
             }
         }
     }
 
-    hierarchy.into_iter().rev().enumerate().for_each(|(i, u)| {
+    hier.into_iter().rev().enumerate().for_each(|(i, u)| {
         oneliner.push_str(format!("{}{}", if i > 0 { "," } else { "" }, u).as_str())
     });
     oneliner.push('\n');
     oneliner
 }
 
-fn dn2user(dn: &str) -> Option<&str> {
-    dn.split(',')
-        .find(|s| s.starts_with("CN="))
-        .map(|s| &s[3..])
+fn find_changes(old_state: &SavedState, cur_state: &SavedState) -> Vec<String> {
+    let mut changes = compare_managers(&old_state, &cur_state);
+    let mut direct_report_changes = compare_reports(&old_state, &cur_state);
+    if !direct_report_changes.is_empty() {
+        changes.push("".to_owned());
+        changes.append(&mut direct_report_changes);
+    }
+
+    changes
 }
 
 fn compare_managers(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
@@ -338,17 +429,6 @@ fn compare_managers(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
     if !changes.is_empty() {
         changes.insert(0, "Employee manager changes\n".to_owned());
     }
-    changes
-}
-
-fn find_changes(old_state: &SavedState, cur_state: &SavedState) -> Vec<String> {
-    let mut changes = compare_managers(&old_state, &cur_state);
-    let mut direct_report_changes = compare_reports(&old_state, &cur_state);
-    if !direct_report_changes.is_empty() {
-        changes.push("".to_owned());
-        changes.append(&mut direct_report_changes);
-    }
-
     changes
 }
 
