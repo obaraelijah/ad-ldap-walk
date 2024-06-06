@@ -144,6 +144,20 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
     }
 
+    #[cfg(target_os = "macos")]
+    if set_new_password {
+        info!(
+            "Saving password for {}/{} to keychain",
+            &cmdline.server, &cmdline.bind_user
+        );
+        use security_framework::os::macos::keychain::SecKeychain;
+        let mut keychain = SecKeychain::default()?;
+        keychain.unlock(None)?;
+        keychain
+            .set_generic_password(&cmdline.server, &cmdline.bind_user, password.as_bytes())
+            .map_err(|e| anyhow!("Unable to save password for {}: {}", &cmdline.bind_user, e))?;
+    }
+
     Ok(())
 }
 
